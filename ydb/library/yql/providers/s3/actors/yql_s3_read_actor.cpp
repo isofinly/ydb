@@ -86,6 +86,7 @@
 #include <util/generic/size_literals.h>
 #include <util/stream/format.h>
 #include <util/system/fstat.h>
+#include <util/system/condvar.h>
 
 #include <algorithm>
 #include <queue>
@@ -255,6 +256,136 @@ struct TParquetFileInfo {
     ui64 UncompressedSize = 0;
 };
 
+struct TConcurrentBufferQueue {
+    std::queue<std::vector<char>> Input; // raw
+    bool IsInputFinished = false;
+    std::queue<std::vector<char>> Output; // decompressed
+    bool IsOutputFinished = false;
+    std::exception_ptr OutputException = nullptr;
+    TMutex Mutex;
+    TCondVar ProduceCondVar;
+    TCondVar ConsumeCondVar;
+    
+};
+
+class TProxyBuffer : public NDB::ReadBuffer {
+public:
+    TProxyBuffer(const std::shared_ptr<TConcurrentBufferQueue>& queue)
+        : NDB::ReadBuffer(nullptr, 0ULL), Queue_(queue)
+    {}
+
+private:
+    bool nextImpl() final {
+        with_lock(Queue_->Mutex) {
+            while (Queue_->Input.empty() && !Queue_->IsInputFinished) {
+                Queue_->ProduceCondVar.Wait(Queue_->Mutex);
+            }
+
+            if (Queue_->Input.empty() && Queue_->IsInputFinished) {
+                set(nullptr, 0ULL);
+                return false;
+            }
+
+            Current_ = std::move(Queue_->Input.front());
+            Queue_->Input.pop();
+            working_buffer = NDB::BufferBase::Buffer(Current_.data(), Current_.data() + Current_.size());
+            Queue_->ConsumeCondVar.Signal();
+            return true;
+        }
+    }
+
+private:
+    std::vector<char> Current_;
+    std::shared_ptr<TConcurrentBufferQueue> Queue_;
+};
+
+class TConcurrentBuffer : public NDB::ReadBuffer {
+public:
+    TConcurrentBuffer(NDB::ReadBuffer& rawSource, NDB::ReadBuffer& decompressorSource, const std::shared_ptr<TConcurrentBufferQueue>& queue)
+        : NDB::ReadBuffer(nullptr, 0ULL)
+        , RawSource_(rawSource)
+        , DecompressorSource_(decompressorSource)
+        , Queue_(queue)
+        , BackgroundThread_([this]() {
+            try {
+                while (true) {
+                    std::vector<char> data;
+                    data.resize(64_KB);
+                    auto size = DecompressorSource_.read(data.data(), data.size());
+                    with_lock(Queue_->Mutex) {
+                        if (!size) {
+                            Queue_->IsOutputFinished = true;
+                            Queue_->ConsumeCondVar.Signal();
+                            return;
+                        }
+                        data.resize(size);
+                        Queue_->Output.push(std::move(data));
+                        Queue_->ConsumeCondVar.Signal();
+                    }
+                }
+            } catch (...) {
+                with_lock(Queue_->Mutex) {
+                    Queue_->IsOutputFinished = true;
+                    Queue_->OutputException = std::current_exception();
+                    Queue_->ConsumeCondVar.Signal();
+                }
+            }
+        })
+    {}
+
+    ~TConcurrentBuffer()
+    {
+        BackgroundThread_.join();
+    }
+
+private:
+    bool nextImpl() final {
+        while (true) {
+            with_lock(Queue_->Mutex) {                
+                while (Queue_->Input.size() < 8 && Queue_->Output.size() < 4 && !Queue_->IsInputFinished && !Queue_->IsOutputFinished && !Queue_->OutputException) {
+                    Queue_->Mutex.Release();
+                    std::vector<char> data;
+                    data.resize(8_KB);
+                    auto size = RawSource_.read(data.data(), data.size());
+                    Queue_->Mutex.Acquire();
+                    if (!size) {
+                        Queue_->IsInputFinished = true;
+                        Queue_->ProduceCondVar.Signal();
+                    } else {
+                        data.resize(size);
+                        Queue_->Input.push(std::move(data));
+                        Queue_->ProduceCondVar.Signal();
+                    }
+                }
+
+                if (Queue_->OutputException) {
+                    throw Queue_->OutputException;
+                }
+
+                if (Queue_->IsOutputFinished && Queue_->Output.empty()) {
+                    set(nullptr, 0ULL);
+                    return false;
+                }
+
+                if (Queue_->Output.size() != 0) {
+                    Current_ = std::move(Queue_->Output.front());
+                    Queue_->Output.pop();
+                    working_buffer = NDB::BufferBase::Buffer(Current_.data(), Current_.data() + Current_.size());
+                    return true;
+                } else {
+                    Queue_->ConsumeCondVar.Wait(Queue_->Mutex);
+                }
+            }
+        }
+    }
+
+    NDB::ReadBuffer& RawSource_;
+    NDB::ReadBuffer& DecompressorSource_;
+    std::shared_ptr<TConcurrentBufferQueue> Queue_;
+    std::thread BackgroundThread_;
+    std::vector<char> Current_;    
+};
+
 class TS3ReadCoroImpl : public TActorCoroImpl {
     friend class TS3StreamReadActor;
 
@@ -368,15 +499,26 @@ public:
 
         std::unique_ptr<NDB::ReadBuffer> coroBuffer = std::make_unique<TCoroReadBuffer>(this);
         std::unique_ptr<NDB::ReadBuffer> decompressorBuffer;
+        std::unique_ptr<NDB::ReadBuffer> proxyBuffer;
+        std::unique_ptr<NDB::ReadBuffer> concurrentBuffer;
         NDB::ReadBuffer* buffer = coroBuffer.get();
 
         // lz4 decompressor reads signature in ctor, w/o actual data it will be deadlocked
         DownloadStart(RetryStuff, GetActorSystem(), SelfActorId, ParentActorId, PathIndex, HttpInflightSize);
 
         if (ReadSpec->Compression) {
-            decompressorBuffer = MakeDecompressor(*buffer, ReadSpec->Compression);
-            YQL_ENSURE(decompressorBuffer, "Unsupported " << ReadSpec->Compression << " compression.");
-            buffer = decompressorBuffer.get();
+            if (AsyncDecompressing) {
+                auto queue = std::make_shared<TConcurrentBufferQueue>();
+                proxyBuffer = std::make_unique<TProxyBuffer>(queue);
+                decompressorBuffer = MakeDecompressor(*proxyBuffer, ReadSpec->Compression);
+                YQL_ENSURE(decompressorBuffer, "Unsupported " << ReadSpec->Compression << " compression.");
+                concurrentBuffer = std::make_unique<TConcurrentBuffer>(*buffer, *decompressorBuffer, queue);
+                buffer = concurrentBuffer.get();
+            } else {
+                decompressorBuffer = MakeDecompressor(*buffer, ReadSpec->Compression);
+                YQL_ENSURE(decompressorBuffer, "Unsupported " << ReadSpec->Compression << " compression.");
+                buffer = decompressorBuffer.get();
+            }
         }
 
         auto stream = std::make_unique<NDB::InputStreamFromInputFormat>(
@@ -982,13 +1124,14 @@ public:
         const ::NMonitoring::TDynamicCounters::TCounterPtr& deferredQueueSize,
         const ::NMonitoring::TDynamicCounters::TCounterPtr& httpInflightSize,
         const ::NMonitoring::TDynamicCounters::TCounterPtr& httpDataRps,
-        const ::NMonitoring::TDynamicCounters::TCounterPtr& rawInflightSize)
+        const ::NMonitoring::TDynamicCounters::TCounterPtr& rawInflightSize,
+        bool asyncDecompressing)
         : TActorCoroImpl(256_KB), ReadActorFactoryCfg(readActorFactoryCfg), InputIndex(inputIndex),
         TxId(txId), RetryStuff(retryStuff), ReadSpec(readSpec), ComputeActorId(computeActorId),
         PathIndex(pathIndex), Path(path), Url(url), RowsRemained(maxRows),
         SourceContext(queueBufferCounter),
         DeferredQueueSize(deferredQueueSize), HttpInflightSize(httpInflightSize),
-        HttpDataRps(httpDataRps), RawInflightSize(rawInflightSize) {
+        HttpDataRps(httpDataRps), RawInflightSize(rawInflightSize), AsyncDecompressing(asyncDecompressing) {
     }
 
     ~TS3ReadCoroImpl() override {
@@ -1167,6 +1310,7 @@ private:
     const ::NMonitoring::TDynamicCounters::TCounterPtr HttpInflightSize;
     const ::NMonitoring::TDynamicCounters::TCounterPtr HttpDataRps;
     const ::NMonitoring::TDynamicCounters::TCounterPtr RawInflightSize;
+    const bool AsyncDecompressing;
 };
 
 class TS3ReadCoroActor : public TActorCoro {
@@ -1209,7 +1353,8 @@ public:
         ui64 fileQueueBatchSizeLimit,
         ui64 fileQueueBatchObjectCountLimit,
         ui64 fileQueueConsumersCountDelta,
-        bool asyncDecoding
+        bool asyncDecoding,
+        bool asyncDecompressing
     )   : ReadActorFactoryCfg(readActorFactoryCfg)
         , Gateway(std::move(gateway))
         , HolderFactory(holderFactory)
@@ -1235,7 +1380,8 @@ public:
         , FileQueueBatchSizeLimit(fileQueueBatchSizeLimit)
         , FileQueueBatchObjectCountLimit(fileQueueBatchObjectCountLimit)
         , FileQueueConsumersCountDelta(fileQueueConsumersCountDelta)
-        , AsyncDecoding(asyncDecoding) {
+        , AsyncDecoding(asyncDecoding)
+        , AsyncDecompressing(asyncDecompressing) {
         if (Counters) {
             QueueDataSize = Counters->GetCounter("QueueDataSize");
             QueueDataLimit = Counters->GetCounter("QueueDataLimit");
@@ -1395,7 +1541,8 @@ public:
             DeferredQueueSize,
             HttpInflightSize,
             HttpDataRps,
-            RawInflightSize
+            RawInflightSize,
+            AsyncDecompressing
         );
         if (AsyncDecoding) {
             actorId = Register(new TS3ReadCoroActor(std::move(impl)));
@@ -1815,6 +1962,7 @@ private:
     ui64 FileQueueBatchObjectCountLimit;
     ui64 FileQueueConsumersCountDelta;
     const bool AsyncDecoding;
+    const bool AsyncDecompressing;
     bool IsCurrentBatchEmpty = false;
     bool IsFileQueueEmpty = false;
     bool IsWaitingFileQueueResponse = false;
@@ -2167,7 +2315,7 @@ std::pair<NYql::NDq::IDqComputeActorAsyncInput*, IActor*> CreateS3ReadActor(
                                                   std::move(paths), addPathIndex, readSpec, computeActorId, retryPolicy,
                                                   cfg, counters, taskCounters, fileSizeLimit, sizeLimit, rowsLimitHint, memoryQuotaManager,
                                                   params.GetUseRuntimeListing(), fileQueueActor, fileQueueBatchSizeLimit, fileQueueBatchObjectCountLimit, fileQueueConsumersCountDelta,
-                                                  params.GetAsyncDecoding());
+                                                  params.GetAsyncDecoding(), params.GetAsyncDecompressing());
 
         return {actor, actor};
     } else {
