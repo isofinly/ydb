@@ -85,7 +85,11 @@ IGraphTransformer::TStatus WideMapWrapper(const TExprNode::TPtr& input, TExprNod
         }
     }
 
-    input->SetTypeAnn(ctx.Expr.MakeType<TFlowExprType>(GetWideLambdaOutputType(*lambda, ctx.Expr)));
+    auto multiType2 = GetWideLambdaOutputType(*lambda, ctx.Expr);
+    for (const auto& type: multiType->GetItems()) {
+        type->Out(Cerr);
+    }
+    input->SetTypeAnn(ctx.Expr.MakeType<TFlowExprType>(multiType2));
     return IGraphTransformer::TStatus::Ok;
 }
 

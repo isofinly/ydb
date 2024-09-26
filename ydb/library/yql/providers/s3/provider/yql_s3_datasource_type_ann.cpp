@@ -277,7 +277,7 @@ bool ExtractSettingValue(const TExprNode& value, TStringBuf settingName, TString
 }
 
 bool EnsureParquetTypeSupported(TPositionHandle position, const TTypeAnnotationNode* type, TExprContext& ctx, const IArrowResolver::TPtr& arrowResolver) {
-    auto resolveStatus = arrowResolver->AreTypesSupported(ctx.GetPosition(position), { type }, ctx, true);
+    auto resolveStatus = arrowResolver->AreTypesSupported(ctx.GetPosition(position), { type }, ctx, false);
     YQL_ENSURE(resolveStatus != IArrowResolver::ERROR);
 
     if (resolveStatus != IArrowResolver::OK) {
@@ -541,7 +541,8 @@ public:
             YQL_ENSURE(State_->Types->ArrowResolver);
             bool allTypesSupported = true;
             for (const auto& item : rowType->Cast<TStructExprType>()->GetItems()) {
-                if (!EnsureParquetTypeSupported(input->Pos(), item->GetItemType(), ctx, State_->Types->ArrowResolver)) {
+                auto type = item->GetItemType();
+                if (!EnsureParquetTypeSupported(input->Pos(), type->GetKind() == ETypeAnnotationKind::List ? ctx.MakeType<TDataExprType>(EDataSlot::String) : item->GetItemType(), ctx, State_->Types->ArrowResolver)) {
                     allTypesSupported = false;
                 }
             }

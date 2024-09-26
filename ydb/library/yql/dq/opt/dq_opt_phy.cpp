@@ -2851,9 +2851,39 @@ NNodes::TExprBase DqBuildStageWithSourceWrap(NNodes::TExprBase node, TExprContex
         .Build();
 
     if (supportsBlocks) {
+        Cerr << "HERE: " << "WideFromBlocks " << Endl;
         wideWrap = ctx.Builder(node.Pos())
             .Callable("WideFromBlocks")
                 .Add(0, wideWrap)
+            .Seal()
+            .Build();
+
+        TExprNodeList args;
+        TExprNodeList bodyItems;
+
+        for (const auto& item : inputType->Cast<TStructExprType>()->GetItems()) {
+            auto type = item->GetItemType();
+            type->Out(Cerr);
+            // Cerr << "TYPE: " << type << Endl;
+            auto arg = ctx.NewArgument(node.Pos(), "arg");
+            args.push_back(arg);
+
+            if (item->GetKind() == ETypeAnnotationKind::List) {
+                bodyItems.push_back(ctx.NewCallable(node.Pos(), "Unpickle", { ExpandType(node.Pos(), *type, ctx), arg }));
+                
+            } else {
+                bodyItems.push_back(arg);
+            }
+            
+            if (args.size() == 3) {
+                break;
+            }
+        }
+
+        wideWrap = ctx.Builder(node.Pos())
+            .Callable("WideMap")
+                .Add(0, wideWrap)
+                .Add(1, ctx.NewLambda(node.Pos(), ctx.NewArguments(node.Pos(), std::move(args)), std::move(bodyItems)))
             .Seal()
             .Build();
     }

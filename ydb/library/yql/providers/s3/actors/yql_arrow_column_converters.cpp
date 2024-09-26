@@ -561,6 +561,11 @@ TColumnConverter BuildCustomConverter(const std::shared_ptr<arrow::DataType>& or
                     return {};
             }
         }
+        case arrow::Type::LIST: {
+            return [](const std::shared_ptr<arrow::Array>& value) {
+                return value;
+            };
+        }
         case arrow::Type::DECIMAL128: {
             switch (slotItem) {
                 case NUdf::EDataSlot::Decimal: {

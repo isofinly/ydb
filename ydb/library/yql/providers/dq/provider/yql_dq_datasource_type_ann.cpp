@@ -101,7 +101,11 @@ private:
             std::transform(items.cbegin(), items.cend(), std::back_inserter(types), std::bind(&TItemExprType::GetItemType, std::placeholders::_1));
             if constexpr (Blocks) {
                 for (auto& type : types) {
-                    type = ctx.MakeType<TBlockExprType>(type);
+                    if (type->GetKind() == ETypeAnnotationKind::List) {
+                        type = ctx.MakeType<TBlockExprType>(ctx.MakeType<TDataExprType>(EDataSlot::String));
+                    } else {
+                        type = ctx.MakeType<TBlockExprType>(type);
+                    }
                 }
 
                 types.push_back(ctx.MakeType<TScalarExprType>(ctx.MakeType<TDataExprType>(EDataSlot::Uint64)));
