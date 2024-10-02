@@ -380,6 +380,16 @@ void TTopicSession::Handle(NFq::TEvPrivate::TEvDataParsed::TPtr& ev) {
         LOG_ROW_DISPATCHER_TRACE("v " << v);
     }
 
+    // static int counter = 0;
+    // counter++;
+    // if (counter % 100000 == 0 || counter >= 2100000) {
+    //     Cerr << "Counter: " << counter << Endl;
+    // }
+    
+    // if (counter != 2200000) {
+    //     return;
+    // }
+
     for (auto& [actorId, info] : Clients) {
         try {
             if (!info.Filter) {
@@ -549,6 +559,15 @@ void TTopicSession::SendToParsing(ui64 offset, const TString& message) {
         }
     }
 
+    // static int counter = 0;
+    // counter++;
+    // if (counter % 100000 == 0 || counter >= 2100000) {
+    //     Cerr << "Counter: " << counter << Endl;
+    // }
+    
+    // if (counter != 2200000) {
+    //     return;
+    // }
     try {
         Parser->Push(offset, message);
     } catch (const std::exception& e) {

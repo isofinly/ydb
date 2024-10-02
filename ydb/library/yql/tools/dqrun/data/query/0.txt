@@ -1,0 +1,16 @@
+-- pragma UseBlocks="true";
+-- pragma config.flags("LLVM", "ON");
+PRAGMA dq.MaxTasksPerStage="1";
+$match = SELECT *
+FROM pq.`match`
+WITH (
+    FORMAT=json_each_row,
+    SCHEMA
+    (
+        c0 String,c1 Uint64,c2 Uint64,c3 String,c4 Uint64,c5 String,c6 String,c7 String,c8 String,c9 String,c10 String,c11 Uint64,c12 String,c13 Uint64,c14 Uint64,c15 Uint64,c16 Uint64,c17 Uint64,c18 Uint64,c19 String,c20 String,c21 Uint64,c22 String,c23 String,c24 Uint64,c25 Uint64,c26 String,c27 String,c28 Uint64,c29 Uint64,c30 String,c31 String,c32 String,c33 Uint64,c34 Uint64,c35 Uint64,c36 String,c37 Uint64,c38 Uint64,c39 String,time Uint64
+    )
+)
+WHERE c0 == "swiqjaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+INSERT INTO pq.`match`
+SELECT ToBytes(Unwrap(Yson::SerializeJson(Yson::From(TableRow())))) FROM $match;

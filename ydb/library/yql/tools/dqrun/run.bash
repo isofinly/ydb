@@ -1,0 +1,1 @@
+time ./dqrun -v 6 -s -p data/query/0.txt --gateways-cfg=examples/gateways.conf --fs-cfg=examples/fs.conf --emulate-pq=match@data/data.txt --op-id=query1 --fq-cfg=examples/fq.conf --threads=2 # --udfs-dir=/home/hcpp/ydb_github/ydb/ydb/library/yql/udfs/common
