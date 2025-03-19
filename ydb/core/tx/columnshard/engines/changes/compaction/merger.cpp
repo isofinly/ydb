@@ -157,15 +157,18 @@ std::vector<TWritePortionInfoWithBlobsResult> TMerger::Execute(const std::shared
                 dataWithSecondary.GetSecondaryInplaceData(), pathId, resultFiltered->GetVersion(), resultFiltered->GetSnapshot(),
                 SaverContext.GetStoragesManager());
 
-            NArrow::TFirstLastSpecialKeys primaryKeys(slice.GetFirstLastPKBatch(resultFiltered->GetIndexInfo().GetReplaceKey()));
-            NArrow::TMinMaxSpecialKeys snapshotKeys(b, TIndexInfo::ArrowSchemaSnapshot());
-            constructor.GetPortionConstructor().MutablePortionConstructor().AddMetadata(*resultFiltered, deletionsCount, primaryKeys, snapshotKeys);
-            constructor.GetPortionConstructor().MutablePortionConstructor().MutableMeta().SetTierName(IStoragesManager::DefaultStorageId);
-            if (shardingActualVersion) {
-                constructor.GetPortionConstructor().MutablePortionConstructor().SetShardingVersion(*shardingActualVersion);
+            {
+                TMemoryProfileGuard g("Compaction::Merger::BuildPortionMetadata");
+                NArrow::TFirstLastSpecialKeys primaryKeys(slice.GetFirstLastPKBatch(resultFiltered->GetIndexInfo().GetReplaceKey()));
+                NArrow::TMinMaxSpecialKeys snapshotKeys(b, TIndexInfo::ArrowSchemaSnapshot());
+                constructor.GetPortionConstructor().MutablePortionConstructor().AddMetadata(*resultFiltered, deletionsCount, primaryKeys, snapshotKeys);
+                constructor.GetPortionConstructor().MutablePortionConstructor().MutableMeta().SetTierName(IStoragesManager::DefaultStorageId);
+                if (shardingActualVersion) {
+                    constructor.GetPortionConstructor().MutablePortionConstructor().SetShardingVersion(*shardingActualVersion);
+                }
+                result.emplace_back(std::move(constructor));
+                recordIdx += slice.GetRecordsCount();
             }
-            result.emplace_back(std::move(constructor));
-            recordIdx += slice.GetRecordsCount();
         }
     }
     return result;
