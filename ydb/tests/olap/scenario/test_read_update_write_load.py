@@ -3,7 +3,10 @@ import random
 import sys
 import threading
 import time
+import os
+import ydb
 from conftest import BaseTestSet
+from multiprocessing import Process
 from typing import List, Dict, Any
 from ydb import PrimitiveType
 from ydb.tests.olap.common.range_allocator import RangeAllocator
@@ -16,6 +19,7 @@ from ydb.tests.olap.scenario.helpers import (
     CreateTable,
 )
 from ydb.tests.olap.lib.utils import get_external_param
+from ydb.tests.olap.lib.ydb_cluster import YdbCluster
 
 
 class TestReadUpdateWriteLoad(BaseTestSet):
@@ -31,22 +35,29 @@ class TestReadUpdateWriteLoad(BaseTestSet):
     range_allocator = RangeAllocator()
 
     def _loop_upsert(self, ctx: TestContext, size_kib: int):
-        sth = ScenarioTestHelper(ctx)
+        column_types = ydb.BulkUpsertColumns()
+        column_types.add_column("key", ydb.PrimitiveType.Int64)
+        column_types.add_column("value", ydb.PrimitiveType.Utf8)
+        # sth = ScenarioTestHelper(ctx)
         count_keys = math.ceil(size_kib / 100)
         keys_range = self.range_allocator.allocate_range(count_keys)
         hist = TimeHistogram("Write")
 
         batch: List[Dict[str, Any]] = []
-        for key in range(keys_range.left, keys_range.right):
-            value = random_string(100 * 1024)  # 100 KiB
-            batch.append({"key": key, "value": value})
-            if len(batch) == 200:  # 20 MiB
-                hist.timeit(lambda: sth.bulk_upsert_data(self.big_table_name, self.big_table_schema, batch))
-                batch.clear()
-            if (key - keys_range.left + 1) * 100 >= size_kib:
-                if len(batch) > 0:
-                    hist.timeit(lambda: sth.bulk_upsert_data(self.big_table_name, self.big_table_schema, batch))
-                break
+        with ydb.Driver(
+            ydb.DriverConfig(YdbCluster.ydb_endpoint, YdbCluster.ydb_database)
+        ) as driver:
+            driver.wait(timeout=5)
+            for key in range(keys_range.left, keys_range.right):
+                value = random_string(100 * 1024)  # 100 KiB
+                batch.append({"key": key, "value": value})
+                if len(batch) == 200:  # 20 MiB
+                    hist.timeit(lambda: driver.table_client.bulk_upsert(self.big_table_name, batch, column_types))
+                    batch.clear()
+                if (key - keys_range.left + 1) * 100 >= size_kib:
+                    if len(batch) > 0:
+                        hist.timeit(lambda: driver.table_client.bulk_upsert(self.big_table_name, batch, column_types))
+                    break
         print(hist, file=sys.stderr)
 
     def _loop_random_read(self, ctx: TestContext, finished: threading.Event):
@@ -95,12 +106,12 @@ class TestReadUpdateWriteLoad(BaseTestSet):
             prev = curr
 
     def scenario_read_update_write_load(self, ctx: TestContext):
-        sth = ScenarioTestHelper(ctx)
+        # sth = ScenarioTestHelper(ctx)
         table_size_mib = int(get_external_param("table_size_mib", "64"))
 
         assert table_size_mib >= 64, "invalid table_size_mib parameter"
 
-        sth.execute_scheme_query(CreateTable(self.big_table_name).with_schema(self.big_table_schema))
+        # sth.execute_scheme_query(CreateTable(self.big_table_name).with_schema(self.big_table_schema))
 
         progress_finished = threading.Event()
         progress_tracker_threads: TestThreads = TestThreads()
@@ -111,74 +122,77 @@ class TestReadUpdateWriteLoad(BaseTestSet):
 
         math.ceil(table_size_mib * 1024 / 10 / 64)
 
-        upsert_only_threads: TestThreads = TestThreads()
+        upsert_only_threads = []
         for i in range(64):
             upsert_only_threads.append(
-                TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
+                Process(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
             )
-        upsert_only_threads.start_all()
-        upsert_only_threads.join_all()
+        for thread in upsert_only_threads:
+            thread.start()
 
-        print("Step 2. read write", file=sys.stderr)
-        upsert_threads: TestThreads = TestThreads()
-        for i in range(64):
-            upsert_threads.append(
-                TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
-            )
+        for thread in upsert_only_threads:
+            thread.join()
 
-        finished = threading.Event()
-        read_threads: TestThreads = TestThreads()
-        read_threads.append(TestThread(target=self._loop_random_read, args=[ctx, finished]))
+        # print("Step 2. read write", file=sys.stderr)
+        # upsert_threads: TestThreads = TestThreads()
+        # for i in range(64):
+        #     upsert_threads.append(
+        #         TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
+        #     )
 
-        read_threads.start_all()
-        upsert_threads.start_all()
+        # finished = threading.Event()
+        # read_threads: TestThreads = TestThreads()
+        # read_threads.append(TestThread(target=self._loop_random_read, args=[ctx, finished]))
 
-        upsert_threads.join_all()
-        finished.set()
-        read_threads.join_all()
+        # read_threads.start_all()
+        # upsert_threads.start_all()
 
-        print("Step 3. write modify", file=sys.stderr)
+        # upsert_threads.join_all()
+        # finished.set()
+        # read_threads.join_all()
 
-        upsert_threads: TestThreads = TestThreads()
-        for i in range(64):
-            upsert_threads.append(
-                TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
-            )
+        # print("Step 3. write modify", file=sys.stderr)
 
-        finished = threading.Event()
-        update_threads: TestThreads = TestThreads()
-        update_threads.append(TestThread(target=self._loop_random_update, args=[ctx, finished]))
+        # upsert_threads: TestThreads = TestThreads()
+        # for i in range(64):
+        #     upsert_threads.append(
+        #         TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 / 10 / 64)])
+        #     )
 
-        update_threads.start_all()
-        upsert_threads.start_all()
+        # finished = threading.Event()
+        # update_threads: TestThreads = TestThreads()
+        # update_threads.append(TestThread(target=self._loop_random_update, args=[ctx, finished]))
 
-        upsert_threads.join_all()
-        finished.set()
-        update_threads.join_all()
+        # update_threads.start_all()
+        # upsert_threads.start_all()
 
-        print("Step 4. read modify write", file=sys.stderr)
+        # upsert_threads.join_all()
+        # finished.set()
+        # update_threads.join_all()
 
-        upsert_threads: TestThreads = TestThreads()
-        for i in range(64):
-            upsert_threads.append(
-                TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 * 7 / 10 / 64)])
-            )
+        # print("Step 4. read modify write", file=sys.stderr)
 
-        finished = threading.Event()
-        update_threads: TestThreads = TestThreads()
-        update_threads.append(TestThread(target=self._loop_random_update, args=[ctx, finished]))
+        # upsert_threads: TestThreads = TestThreads()
+        # for i in range(64):
+        #     upsert_threads.append(
+        #         TestThread(target=self._loop_upsert, args=[ctx, math.ceil(table_size_mib * 1024 * 7 / 10 / 64)])
+        #     )
 
-        read_threads: TestThreads = TestThreads()
-        read_threads.append(TestThread(target=self._loop_random_read, args=[ctx, finished]))
+        # finished = threading.Event()
+        # update_threads: TestThreads = TestThreads()
+        # update_threads.append(TestThread(target=self._loop_random_update, args=[ctx, finished]))
 
-        read_threads.start_all()
-        update_threads.start_all()
-        upsert_threads.start_all()
+        # read_threads: TestThreads = TestThreads()
+        # read_threads.append(TestThread(target=self._loop_random_read, args=[ctx, finished]))
 
-        upsert_threads.join_all()
-        finished.set()
-        update_threads.join_all()
-        read_threads.join_all()
+        # read_threads.start_all()
+        # update_threads.start_all()
+        # upsert_threads.start_all()
 
-        progress_finished.set()
-        progress_tracker_threads.join_all()
+        # upsert_threads.join_all()
+        # finished.set()
+        # update_threads.join_all()
+        # read_threads.join_all()
+
+        # progress_finished.set()
+        # progress_tracker_threads.join_all()
