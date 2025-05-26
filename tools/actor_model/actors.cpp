@@ -9,18 +9,17 @@
 namespace {
     /// Maximum computation time per actor cycle to avoid blocking
     constexpr auto MAX_COMPUTATION_TIME_SLICE = TDuration::MilliSeconds(10);
-    
+
     /// Shared program state controller
     auto ShouldContinue = std::make_shared<TProgramShouldContinue>();
 }
 
 /**
  * Actor responsible for computing the largest prime factor of a single number.
- * Uses time-sliced computation to avoid blocking the actor system.
  */
-class TMaximumPrimeDevisorActor 
+class TMaximumPrimeDevisorActor
     : public NActors::TActorBootstrapped<TMaximumPrimeDevisorActor> {
-    
+
     const int64_t OriginalNumber;
     const NActors::TActorId OriginatorActorId;
     const NActors::TActorId ResultCollectorId;
@@ -31,15 +30,25 @@ class TMaximumPrimeDevisorActor
     int64_t LargestPrimeFactor;
 
 public:
-    TMaximumPrimeDevisorActor(int64_t number, 
+    TMaximumPrimeDevisorActor(int64_t number,
                               NActors::TActorId originator,
                               NActors::TActorId collector)
         : OriginalNumber(number)
         , OriginatorActorId(originator)
         , ResultCollectorId(collector)
-        , RemainingValue(InitializeRemainingValue(number))
-        , CurrentDivisor(2)
-        , LargestPrimeFactor(InitializeLargestFactor(number)) {
+        , CurrentDivisor(2) {
+
+        // Initialize based on the original number
+        if (OriginalNumber <= 0) {
+            LargestPrimeFactor = 0;
+            RemainingValue = 0;
+        } else if (OriginalNumber == 1) {
+            LargestPrimeFactor = 1;
+            RemainingValue = 1;
+        } else {
+            LargestPrimeFactor = 1;
+            RemainingValue = OriginalNumber;
+        }
     }
 
     void Bootstrap() {
@@ -52,17 +61,11 @@ public:
     });
 
 private:
-    static int64_t InitializeRemainingValue(int64_t number) {
-        return (number <= 0) ? 0 : ((number == 1) ? 1 : number);
-    }
-    
-    static int64_t InitializeLargestFactor(int64_t number) {
-        return (number <= 0) ? 0 : 1;
-    }
-
     void ProcessFactorization() {
+        // Handle special cases immediately
         if (RemainingValue <= 1) {
-            CompleteComputationAndExit(RemainingValue == 0 ? 0 : LargestPrimeFactor);
+            int64_t result = (RemainingValue == 0) ? 0 : LargestPrimeFactor;
+            CompleteComputationAndExit(result);
             return;
         }
 
@@ -70,9 +73,9 @@ private:
 
         // Handle factor of 2 separately for optimization
         if (CurrentDivisor == 2) {
-            ExtractPrimeFactor(2);
+            ExtractAllFactorsOf(2);
             CurrentDivisor = 3; // Move to odd numbers only
-            
+
             if (IsComputationTimeLimitReached(computationStartTime)) {
                 return;
             }
@@ -83,8 +86,8 @@ private:
             if (IsComputationTimeLimitReached(computationStartTime)) {
                 return;
             }
-            
-            ExtractPrimeFactor(CurrentDivisor);
+
+            ExtractAllFactorsOf(CurrentDivisor);
             CurrentDivisor += 2; // Skip even numbers
         }
 
@@ -96,10 +99,10 @@ private:
         CompleteComputationAndExit(LargestPrimeFactor);
     }
 
-    void ExtractPrimeFactor(int64_t factor) {
+    void ExtractAllFactorsOf(int64_t factor) {
         if (RemainingValue % factor == 0) {
             LargestPrimeFactor = factor;
-            
+
             // Remove all instances of this factor
             while (RemainingValue % factor == 0) {
                 RemainingValue /= factor;
@@ -122,10 +125,10 @@ private:
     void CompleteComputationAndExit(int64_t result) {
         // Send result to aggregator
         Send(ResultCollectorId, MakeHolder<TEvents::TEvWriteValueRequest>(result));
-        
+
         // Notify originator of completion
         Send(OriginatorActorId, MakeHolder<TEvents::TEvTaskCompleted>());
-        
+
         // Terminate this actor
         PassAway();
     }
@@ -133,7 +136,6 @@ private:
 
 /**
  * Actor responsible for reading numbers from input stream and managing computation tasks.
- * Coordinates between input processing and result aggregation.
  */
 class TReadActor : public NActors::TActorBootstrapped<TReadActor> {
     std::istream& InputStream;
@@ -202,13 +204,12 @@ private:
 
 /**
  * Actor responsible for aggregating computation results and producing final output.
- * Accumulates largest prime factors and outputs their sum when processing is complete.
  */
 class TWriteActor : public NActors::TActor<TWriteActor> {
     int64_t AccumulatedSum;
 
 public:
-    TWriteActor() 
+    TWriteActor()
         : NActors::TActor<TWriteActor>(&TWriteActor::StateFunc)
         , AccumulatedSum(0) {
     }
@@ -231,37 +232,35 @@ private:
 };
 
 /**
- * Monitoring actor that verifies system responsiveness by sending periodic self-messages.
- * Helps detect system overload or deadlock conditions.
+ * Monitoring actor that verifies system responsiveness.
  */
 class TSelfPingActor : public NActors::TActorBootstrapped<TSelfPingActor> {
     const TDuration PingLatency;
     TInstant LastPingTime;
 
 public:
-    explicit TSelfPingActor(const TDuration& latency) 
+    explicit TSelfPingActor(const TDuration& latency)
         : PingLatency(latency) {
     }
 
-    void Bootstrap(const NActors::TActorContext& context) {
+    void Bootstrap() {
         LastPingTime = TInstant::Now();
         Become(&TSelfPingActor::StateFunc);
-        context.Send(context.SelfID, std::make_unique<NActors::TEvents::TEvWakeup>());
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
     }
 
-    void HandlePingResponse(NActors::TEvents::TEvWakeup::TPtr&,
-                           const NActors::TActorContext& context) {
+    void HandlePingResponse(NActors::TEvents::TEvWakeup::TPtr&) {
         const auto currentTime = TInstant::Now();
         const auto actualLatency = currentTime - LastPingTime;
-        
+
         Y_VERIFY(actualLatency <= PingLatency, "System latency exceeded threshold");
-        
+
         LastPingTime = currentTime;
-        context.Send(context.SelfID, std::make_unique<NActors::TEvents::TEvWakeup>());
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
     }
 
     STRICT_STFUNC(StateFunc, {
-        HFunc(NActors::TEvents::TEvWakeup, HandlePingResponse);
+        hFunc(NActors::TEvents::TEvWakeup, HandlePingResponse);
     });
 };
 
@@ -279,7 +278,7 @@ THolder<NActors::IActor> CreateSelfPingActor(const TDuration& latency) {
     return MakeHolder<TSelfPingActor>(latency);
 }
 
-THolder<NActors::IActor> CreateMaximumPrimeDevisorActor(int64_t number, 
+THolder<NActors::IActor> CreateMaximumPrimeDevisorActor(int64_t number,
                                                          NActors::TActorId originator,
                                                          NActors::TActorId collector) {
     return MakeHolder<TMaximumPrimeDevisorActor>(number, originator, collector);
