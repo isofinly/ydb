@@ -1,124 +1,288 @@
 #include "actors.h"
 #include "events.h"
+
+#include <library/cpp/actors/core/actor.h>
 #include <library/cpp/actors/core/actor_bootstrapped.h>
 #include <library/cpp/actors/core/hfunc.h>
+#include <util/datetime/base.h>
 
-static auto ShouldContinue = std::make_shared<TProgramShouldContinue>();
+namespace {
+    /// Maximum computation time per actor cycle to avoid blocking
+    constexpr auto MAX_COMPUTATION_TIME_SLICE = TDuration::MilliSeconds(10);
+    
+    /// Shared program state controller
+    auto ShouldContinue = std::make_shared<TProgramShouldContinue>();
+}
 
-/*
-Вам нужно написать реализацию TReadActor, TMaximumPrimeDevisorActor, TWriteActor
-*/
+/**
+ * Actor responsible for computing the largest prime factor of a single number.
+ * Uses time-sliced computation to avoid blocking the actor system.
+ */
+class TMaximumPrimeDevisorActor 
+    : public NActors::TActorBootstrapped<TMaximumPrimeDevisorActor> {
+    
+    const int64_t OriginalNumber;
+    const NActors::TActorId OriginatorActorId;
+    const NActors::TActorId ResultCollectorId;
 
-/*
-Требования к TReadActor:
-1. Рекомендуется отнаследовать этот актор от NActors::TActorBootstrapped
-2. В Boostrap этот актор отправляет себе NActors::TEvents::TEvWakeup
-3. После получения этого сообщения считывается новое int64_t значение из strm
-4. После этого порождается новый TMaximumPrimeDevisorActor который занимается вычислениями
-5. Далее актор посылает себе сообщение NActors::TEvents::TEvWakeup чтобы не блокировать поток этим актором
-6. Актор дожидается завершения всех TMaximumPrimeDevisorActor через TEvents::TEvDone
-7. Когда чтение из файла завершено и получены подтверждения от всех TMaximumPrimeDevisorActor,
-этот актор отправляет сообщение NActors::TEvents::TEvPoisonPill в TWriteActor
-
-TReadActor
-    Bootstrap:
-        send(self, NActors::TEvents::TEvWakeup)
-
-    NActors::TEvents::TEvWakeup:
-        if read(strm) -> value:
-            register(TMaximumPrimeDevisorActor(value, self, receipment))
-            send(self, NActors::TEvents::TEvWakeup)
-        else:
-            ...
-
-    TEvents::TEvDone:
-        if Finish:
-            send(receipment, NActors::TEvents::TEvPoisonPill)
-        else:
-            ...
-*/
-
-// TODO: напишите реализацию TReadActor
-
-/*
-Требования к TMaximumPrimeDevisorActor:
-1. Рекомендуется отнаследовать этот актор от NActors::TActorBootstrapped
-2. В конструкторе этот актор принимает:
- - значение для которого нужно вычислить простое число
- - ActorId отправителя (ReadActor)
- - ActorId получателя (WriteActor)
-2. В Boostrap этот актор отправляет себе NActors::TEvents::TEvWakeup по вызову которого происходит вызов Handler для вычислений
-3. Вычисления нельзя проводить больше 10 миллисекунд
-4. По истечении этого времени нужно сохранить текущее состояние вычислений в акторе и отправить себе NActors::TEvents::TEvWakeup
-5. Когда результат вычислен он посылается в TWriteActor c использованием сообщения TEvWriteValueRequest
-6. Далее отправляет ReadActor сообщение TEvents::TEvDone
-7. Завершает свою работу
-
-TMaximumPrimeDevisorActor
-    Bootstrap:
-        send(self, NActors::TEvents::TEvWakeup)
-
-    NActors::TEvents::TEvWakeup:
-        calculate
-        if > 10 ms:
-            Send(SelfId(), NActors::TEvents::TEvWakeup)
-        else:
-            Send(WriteActor, TEvents::TEvWriteValueRequest)
-            Send(ReadActor, TEvents::TEvDone)
-            PassAway()
-*/
-
-// TODO: напишите реализацию TMaximumPrimeDevisorActor
-
-/*
-Требования к TWriteActor:
-1. Рекомендуется отнаследовать этот актор от NActors::TActor
-2. Этот актор получает два типа сообщений NActors::TEvents::TEvPoisonPill::EventType и TEvents::TEvWriteValueRequest
-2. В случае TEvents::TEvWriteValueRequest он принимает результат посчитанный в TMaximumPrimeDevisorActor и прибавляет его к локальной сумме
-4. В случае NActors::TEvents::TEvPoisonPill::EventType актор выводит в Cout посчитанную локальнкую сумму, проставляет ShouldStop и завершает свое выполнение через PassAway
-
-TWriteActor
-    TEvents::TEvWriteValueRequest ev:
-        Sum += ev->Value
-
-    NActors::TEvents::TEvPoisonPill::EventType:
-        Cout << Sum << Endl;
-        ShouldStop()
-        PassAway()
-*/
-
-// TODO: напишите реализацию TWriteActor
-
-class TSelfPingActor : public NActors::TActorBootstrapped<TSelfPingActor> {
-    TDuration Latency;
-    TInstant LastTime;
+    // Computation state
+    int64_t RemainingValue;
+    int64_t CurrentDivisor;
+    int64_t LargestPrimeFactor;
 
 public:
-    TSelfPingActor(const TDuration& latency)
-        : Latency(latency)
-    {}
+    TMaximumPrimeDevisorActor(int64_t number, 
+                              NActors::TActorId originator,
+                              NActors::TActorId collector)
+        : OriginalNumber(number)
+        , OriginatorActorId(originator)
+        , ResultCollectorId(collector)
+        , RemainingValue(InitializeRemainingValue(number))
+        , CurrentDivisor(2)
+        , LargestPrimeFactor(InitializeLargestFactor(number)) {
+    }
 
     void Bootstrap() {
-        LastTime = TInstant::Now();
-        Become(&TSelfPingActor::StateFunc);
-        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+        Become(&TMaximumPrimeDevisorActor::StateFunc);
+        ScheduleNextComputationCycle();
     }
 
     STRICT_STFUNC(StateFunc, {
-        cFunc(NActors::TEvents::TEvWakeup::EventType, HandleWakeup);
+        cFunc(NActors::TEvents::TEvWakeup::EventType, ProcessFactorization);
     });
 
-    void HandleWakeup() {
-        auto now = TInstant::Now();
-        TDuration delta = now - LastTime;
-        Y_VERIFY(delta <= Latency, "Latency too big");
-        LastTime = now;
+private:
+    static int64_t InitializeRemainingValue(int64_t number) {
+        return (number <= 0) ? 0 : ((number == 1) ? 1 : number);
+    }
+    
+    static int64_t InitializeLargestFactor(int64_t number) {
+        return (number <= 0) ? 0 : 1;
+    }
+
+    void ProcessFactorization() {
+        if (RemainingValue <= 1) {
+            CompleteComputationAndExit(RemainingValue == 0 ? 0 : LargestPrimeFactor);
+            return;
+        }
+
+        const auto computationStartTime = TInstant::Now();
+
+        // Handle factor of 2 separately for optimization
+        if (CurrentDivisor == 2) {
+            ExtractPrimeFactor(2);
+            CurrentDivisor = 3; // Move to odd numbers only
+            
+            if (IsComputationTimeLimitReached(computationStartTime)) {
+                return;
+            }
+        }
+
+        // Process odd divisors only (optimization)
+        while (CurrentDivisor * CurrentDivisor <= RemainingValue) {
+            if (IsComputationTimeLimitReached(computationStartTime)) {
+                return;
+            }
+            
+            ExtractPrimeFactor(CurrentDivisor);
+            CurrentDivisor += 2; // Skip even numbers
+        }
+
+        // If remaining value is > 1, it's a prime factor itself
+        if (RemainingValue > 1) {
+            LargestPrimeFactor = RemainingValue;
+        }
+
+        CompleteComputationAndExit(LargestPrimeFactor);
+    }
+
+    void ExtractPrimeFactor(int64_t factor) {
+        if (RemainingValue % factor == 0) {
+            LargestPrimeFactor = factor;
+            
+            // Remove all instances of this factor
+            while (RemainingValue % factor == 0) {
+                RemainingValue /= factor;
+            }
+        }
+    }
+
+    bool IsComputationTimeLimitReached(TInstant startTime) {
+        if (TInstant::Now() - startTime > MAX_COMPUTATION_TIME_SLICE) {
+            ScheduleNextComputationCycle();
+            return true;
+        }
+        return false;
+    }
+
+    void ScheduleNextComputationCycle() {
+        Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+    void CompleteComputationAndExit(int64_t result) {
+        // Send result to aggregator
+        Send(ResultCollectorId, MakeHolder<TEvents::TEvWriteValueRequest>(result));
+        
+        // Notify originator of completion
+        Send(OriginatorActorId, MakeHolder<TEvents::TEvTaskCompleted>());
+        
+        // Terminate this actor
+        PassAway();
+    }
+};
+
+/**
+ * Actor responsible for reading numbers from input stream and managing computation tasks.
+ * Coordinates between input processing and result aggregation.
+ */
+class TReadActor : public NActors::TActorBootstrapped<TReadActor> {
+    std::istream& InputStream;
+    const NActors::TActorId ResultAggregatorId;
+
+    int32_t ActiveComputationTasks;
+    bool InputStreamExhausted;
+
+public:
+    TReadActor(std::istream& inputStream, NActors::TActorId aggregatorId)
+        : InputStream(inputStream)
+        , ResultAggregatorId(aggregatorId)
+        , ActiveComputationTasks(0)
+        , InputStreamExhausted(false) {
+    }
+
+    void Bootstrap() {
+        Become(&TReadActor::StateFunc);
+        ScheduleNextInputRead();
+    }
+
+    STRICT_STFUNC(StateFunc, {
+        cFunc(NActors::TEvents::TEvWakeup::EventType, ProcessNextInput);
+        hFunc(TEvents::TEvTaskCompleted, HandleComputationTaskCompleted);
+    });
+
+private:
+    void ProcessNextInput() {
+        if (InputStreamExhausted) {
+            TryCompleteProcessing();
+            return;
+        }
+
+        int64_t inputValue;
+        if (InputStream >> inputValue) {
+            SpawnComputationTask(inputValue);
+            ScheduleNextInputRead();
+        } else {
+            InputStreamExhausted = true;
+            TryCompleteProcessing();
+        }
+    }
+
+    void SpawnComputationTask(int64_t number) {
+        Register(new TMaximumPrimeDevisorActor(number, SelfId(), ResultAggregatorId));
+        ActiveComputationTasks++;
+    }
+
+    void HandleComputationTaskCompleted(TEvents::TEvTaskCompleted::TPtr&) {
+        ActiveComputationTasks--;
+        TryCompleteProcessing();
+    }
+
+    void TryCompleteProcessing() {
+        if (InputStreamExhausted && ActiveComputationTasks == 0) {
+            // Signal aggregator to output results and terminate
+            Send(ResultAggregatorId, std::make_unique<NActors::TEvents::TEvPoisonPill>());
+            PassAway();
+        }
+    }
+
+    void ScheduleNextInputRead() {
         Send(SelfId(), std::make_unique<NActors::TEvents::TEvWakeup>());
     }
 };
 
+/**
+ * Actor responsible for aggregating computation results and producing final output.
+ * Accumulates largest prime factors and outputs their sum when processing is complete.
+ */
+class TWriteActor : public NActors::TActor<TWriteActor> {
+    int64_t AccumulatedSum;
+
+public:
+    TWriteActor() 
+        : NActors::TActor<TWriteActor>(&TWriteActor::StateFunc)
+        , AccumulatedSum(0) {
+    }
+
+    STRICT_STFUNC(StateFunc, {
+        hFunc(TEvents::TEvWriteValueRequest, AccumulateResult);
+        cFunc(NActors::TEvents::TEvPoisonPill::EventType, OutputResultsAndTerminate);
+    });
+
+private:
+    void AccumulateResult(TEvents::TEvWriteValueRequest::TPtr& event) {
+        AccumulatedSum += event->Get()->Value;
+    }
+
+    void OutputResultsAndTerminate() {
+        Cout << AccumulatedSum << Endl;
+        GetProgramShouldContinue()->ShouldStop(0);
+        PassAway();
+    }
+};
+
+/**
+ * Monitoring actor that verifies system responsiveness by sending periodic self-messages.
+ * Helps detect system overload or deadlock conditions.
+ */
+class TSelfPingActor : public NActors::TActorBootstrapped<TSelfPingActor> {
+    const TDuration PingLatency;
+    TInstant LastPingTime;
+
+public:
+    explicit TSelfPingActor(const TDuration& latency) 
+        : PingLatency(latency) {
+    }
+
+    void Bootstrap(const NActors::TActorContext& context) {
+        LastPingTime = TInstant::Now();
+        Become(&TSelfPingActor::StateFunc);
+        context.Send(context.SelfID, std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+    void HandlePingResponse(NActors::TEvents::TEvWakeup::TPtr&,
+                           const NActors::TActorContext& context) {
+        const auto currentTime = TInstant::Now();
+        const auto actualLatency = currentTime - LastPingTime;
+        
+        Y_VERIFY(actualLatency <= PingLatency, "System latency exceeded threshold");
+        
+        LastPingTime = currentTime;
+        context.Send(context.SelfID, std::make_unique<NActors::TEvents::TEvWakeup>());
+    }
+
+    STRICT_STFUNC(StateFunc, {
+        HFunc(NActors::TEvents::TEvWakeup, HandlePingResponse);
+    });
+};
+
+// Factory function implementations
+THolder<NActors::IActor> CreateReadActor(std::istream& inputStream,
+                                          NActors::TActorId aggregatorId) {
+    return MakeHolder<TReadActor>(inputStream, aggregatorId);
+}
+
+THolder<NActors::IActor> CreateWriteActor() {
+    return MakeHolder<TWriteActor>();
+}
+
 THolder<NActors::IActor> CreateSelfPingActor(const TDuration& latency) {
     return MakeHolder<TSelfPingActor>(latency);
+}
+
+THolder<NActors::IActor> CreateMaximumPrimeDevisorActor(int64_t number, 
+                                                         NActors::TActorId originator,
+                                                         NActors::TActorId collector) {
+    return MakeHolder<TMaximumPrimeDevisorActor>(number, originator, collector);
 }
 
 std::shared_ptr<TProgramShouldContinue> GetProgramShouldContinue() {
