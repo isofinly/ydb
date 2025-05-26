@@ -37,7 +37,7 @@ int main(int argc, const char* argv[]) {
 
     auto writeActorId = actorSystem.Register(CreateWriteActor().Release());
     actorSystem.Register(CreateReadActor(std::cin, writeActorId).Release());
-
+    
     auto shouldContinue = GetProgramShouldContinue();
     while (shouldContinue->PollState() == TProgramShouldContinue::Continue) {
         Sleep(MAIN_LOOP_SLEEP_INTERVAL);
